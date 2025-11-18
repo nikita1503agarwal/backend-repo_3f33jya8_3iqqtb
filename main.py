@@ -214,7 +214,7 @@ def get_court(court_id: str):
         e["_id"] = str(e["_id"])
     c["upcoming_events"] = events
     # frequent players (favorited)
-    users = list(db.user.find({"favorites": court_id}, {"display_name": 1, "dupr_score": 1, "skill_level": 1}))
+    users = list(db.user.find({"favorites": court_id}, {"display_name": 1, "dupr_score": 1, "skill_level": 1, "avatar_url": 1}))
     for u in users:
         u["_id"] = str(u["_id"])
     c["frequent_players"] = users
@@ -404,8 +404,30 @@ def list_events(court_id: Optional[str] = None):
     if court_id:
         f["court_id"] = court_id
     es = list(db.event.find(f).sort([( "date", 1), ("start_time", 1)]))
+
+    # Enrich attendees with profile data (display_name, dupr_score, avatar_url)
+    all_ids: List[str] = []
+    for e in es:
+        for uid in e.get("attendees", []):
+            if uid not in all_ids:
+                all_ids.append(uid)
+    users_map: Dict[str, dict] = {}
+    if all_ids:
+        users_map = {str(u["_id"]): u for u in db.user.find({"_id": {"$in": [oid(uid) for uid in all_ids]}})}
+
     for e in es:
         e["_id"] = str(e["_id"]) 
+        profiles = []
+        for uid in e.get("attendees", []):
+            u = users_map.get(uid)
+            if u:
+                profiles.append({
+                    "_id": str(u["_id"]),
+                    "display_name": u.get("display_name"),
+                    "dupr_score": u.get("dupr_score"),
+                    "avatar_url": u.get("avatar_url"),
+                })
+        e["attendees_profiles"] = profiles
     return es
 
 
