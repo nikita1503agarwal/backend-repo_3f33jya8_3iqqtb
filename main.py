@@ -1,6 +1,6 @@
 import os
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Optional, List, Dict
 
 from fastapi import FastAPI, HTTPException, Depends, Form
 from fastapi.middleware.cors import CORSMiddleware
@@ -169,7 +169,7 @@ def create_court(court: Court, current=Depends(get_current_user)):
 @app.get("/courts")
 def list_courts(status: Optional[str] = "active", q: Optional[str] = None, indoor_outdoor: Optional[str] = None,
                 min_courts: Optional[int] = None, court_type: Optional[str] = None, lighting: Optional[str] = None):
-    filter_dict = {}
+    filter_dict: Dict = {}
     if status:
         filter_dict["status"] = status
     if q:
@@ -197,7 +197,7 @@ def get_court(court_id: str):
     c = db.court.find_one({"_id": oid(court_id)})
     if not c:
         raise HTTPException(status_code=404, detail="Court not found")
-    c["_id"] = str(c["_id"]) 
+    c["_id"] = str(c["_id"])
     # attach average rating
     ratings = list(db.review.find({"court_id": court_id}))
     if ratings:
@@ -211,12 +211,12 @@ def get_court(court_id: str):
     now_iso = datetime.now(timezone.utc).date().isoformat()
     events = list(db.event.find({"court_id": court_id, "date": {"$gte": now_iso}}).sort("date", 1))
     for e in events:
-        e["_id"] = str(e["_id"]) 
+        e["_id"] = str(e["_id"])
     c["upcoming_events"] = events
     # frequent players (favorited)
     users = list(db.user.find({"favorites": court_id}, {"display_name": 1, "dupr_score": 1, "skill_level": 1}))
     for u in users:
-        u["_id"] = str(u["_id"]) 
+        u["_id"] = str(u["_id"])
     c["frequent_players"] = users
     return c
 
@@ -245,7 +245,7 @@ def add_review(court_id: str, review: Review, current=Depends(get_current_user))
 def list_reviews(court_id: str):
     rs = list(db.review.find({"court_id": court_id}).sort("created_at", -1))
     for r in rs:
-        r["_id"] = str(r["_id"]) 
+        r["_id"] = str(r["_id"])
     return rs
 
 
@@ -265,9 +265,24 @@ def unfavorite_court(court_id: str, current=Depends(get_current_user)):
 # -----------------------------
 # Community feed
 # -----------------------------
+
+def _haversine_miles(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Approximate distance between two lat/lon points in miles."""
+    from math import radians, sin, cos, asin, sqrt
+    R_km = 6371.0
+    dlat = radians(lat2 - lat1)
+    dlon = radians(lon2 - lon1)
+    a = sin(dlat/2)**2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon/2)**2
+    c = 2 * asin(sqrt(a))
+    km = R_km * c
+    return km * 0.621371
+
+
 @app.get("/feed")
-def get_feed(filter: Optional[str] = "all", current=Depends(get_current_user)):
-    query = {}
+def get_feed(filter: Optional[str] = "all", sort: Optional[str] = "newest", current=Depends(get_current_user)):
+    query: Dict = {}
+
+    # Base query by filter
     if filter == "mycourts":
         favs = current.get("favorites", [])
         if favs:
@@ -275,11 +290,53 @@ def get_feed(filter: Optional[str] = "all", current=Depends(get_current_user)):
         else:
             return []
     elif filter == "nearme":
-        # Placeholder: without geo index, just return recent
-        pass
-    posts = list(db.post.find(query).sort("created_at", -1).limit(100))
+        # Use user's home_court_id as their home location if available
+        home_court_id = current.get("home_court_id")
+        if not home_court_id:
+            # Fallback: return recent if no home location
+            pass
+        else:
+            home_court = db.court.find_one({"_id": oid(home_court_id)})
+            if home_court and home_court.get("latitude") and home_court.get("longitude"):
+                # Fetch recent posts with a court tag, then filter by distance <= 25 miles
+                base_posts = list(db.post.find({"court_id": {"$ne": None}}).sort("created_at", -1).limit(200))
+                # Map courts for tagged posts
+                court_ids = list({p.get("court_id") for p in base_posts if p.get("court_id")})
+                courts_map = {str(c["_id"]): c for c in db.court.find({"_id": {"$in": [oid(cid) for cid in court_ids]}})}
+                filtered: List[dict] = []
+                for p in base_posts:
+                    cid = p.get("court_id")
+                    c_doc = courts_map.get(cid)
+                    if not c_doc:
+                        continue
+                    try:
+                        miles = _haversine_miles(home_court["latitude"], home_court["longitude"], c_doc.get("latitude"), c_doc.get("longitude"))
+                        if miles <= 25.0:
+                            p["_id"] = str(p["_id"])  # normalize id for response
+                            filtered.append(p)
+                    except Exception:
+                        continue
+                # Sort per requested order below
+                posts = filtered
+                # Apply sort below
+                if sort == "most_liked":
+                    posts.sort(key=lambda x: len(x.get("likes", [])), reverse=True)
+                else:
+                    posts.sort(key=lambda x: x.get("created_at", datetime.now(timezone.utc)), reverse=True)
+                return posts
+            else:
+                # No coordinates for home court; fallback to recent
+                pass
+
+    # Default path: simple query
+    posts = list(db.post.find(query).sort("created_at", -1).limit(200))
+
+    # Sorting
+    if sort == "most_liked":
+        posts.sort(key=lambda x: len(x.get("likes", [])), reverse=True)
+
     for p in posts:
-        p["_id"] = str(p["_id"]) 
+        p["_id"] = str(p["_id"])  # serialize
     return posts
 
 
@@ -308,9 +365,26 @@ def comment_post(post_id: str, payload: Comment, current=Depends(get_current_use
 @app.get("/feed/{post_id}/comments")
 def list_comments(post_id: str):
     cs = list(db.comment.find({"post_id": post_id}).sort("created_at", 1))
+    # Attach commenter info
+    user_ids = list({c.get("author_id") for c in cs if c.get("author_id")})
+    users = {str(u["_id"]): u for u in db.user.find({"_id": {"$in": [oid(uid) for uid in user_ids]}})}
+    enriched = []
     for c in cs:
-        c["_id"] = str(c["_id"]) 
-    return cs
+        c_id = str(c["_id"])
+        u = users.get(c.get("author_id"))
+        enriched.append({
+            "_id": c_id,
+            "post_id": c.get("post_id"),
+            "author_id": c.get("author_id"),
+            "text": c.get("text"),
+            "created_at": c.get("created_at"),
+            "author": {
+                "display_name": u.get("display_name") if u else None,
+                "avatar_url": u.get("avatar_url") if u else None,
+                "dupr_score": u.get("dupr_score") if u else None,
+            }
+        })
+    return enriched
 
 
 # -----------------------------
@@ -329,7 +403,7 @@ def list_events(court_id: Optional[str] = None):
     f = {}
     if court_id:
         f["court_id"] = court_id
-    es = list(db.event.find(f).sort([("date", 1), ("start_time", 1)]))
+    es = list(db.event.find(f).sort([( "date", 1), ("start_time", 1)]))
     for e in es:
         e["_id"] = str(e["_id"]) 
     return es
